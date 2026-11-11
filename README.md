@@ -1,194 +1,287 @@
 # AgentForge
 
-A from-scratch multi-agent framework: TeamLead and Developer agents work through a Kanban
-board. Their tools live in four MCP servers, each started only when it is first needed:
-- group chat
-- personal chat
-- shared knowledge
-- personal memory
+A small, from-scratch multi-agent framework in Python. A **TeamLead** creates tickets, a
+**Developer** takes the tickets assigned to them and submits code, and only the TeamLead can
+mark a ticket **DONE**. The agents coordinate through a Kanban board, team and private chat,
+a shared knowledge folder, and personal memory. Each agent's system prompt rebuilds itself
+whenever one of its tickets changes.
 
-Each agent also has a system prompt that rebuilds itself whenever one of its tickets changes.
+The framework runs with or without an LLM. The non-AI tests cover every rule; the AI test
+uses OpenAI's GPT-6 Luna as the brain of each agent.
 
-## 1. What MCP is, in one paragraph
+## Features
 
-MCP (Model Context Protocol) is a standard way for a program to offer **tools** to another
-program, and especially to an LLM. An **MCP server** is a separate process that says "here are
-my tools, with names, descriptions and input schemas". It then runs a tool when asked. An
-**MCP client** connects to the server, asks for the tool list (`list_tools`), and calls tools
-(`call_tool`). Messages are JSON-RPC sent over stdin/stdout (the "stdio transport"). Because the
-format is standard, the same server can be used by your framework, by Claude, by GPT-6 Luna
-(once its tools are converted to the OpenAI format), or by any other MCP client.
+- **Teams and roles.** Each team has one TeamLead and any number of Developers. A name can
+  hold only one role across the whole forge, so the same person can't be both.
+- **Graph flow.** Wire agents together with `move_to` (fixed hop) and `branch_to` (decide at
+  run time), then call `run()`. A step limit stops accidental infinite loops.
+- **Kanban board** with the statuses `TODO → IN_PROGRESS → REVIEW → DONE`, and strict rules
+  about who may move a ticket where (see [Ticket rules](#ticket-rules)).
+- **Chat through MCP servers.** Group channels per team plus a `general` channel, and private
+  one-to-one chats with an unread inbox.
+- **Rolling chat summaries.** Agents summarize what has been said so far and only summarize
+  new messages on later calls.
+- **Shared knowledge ("plugin memory").** Drop PDF, Markdown or text files into
+  `project_brain/`; agents search them with keyword ranking and cite the page they used.
+- **Personal memory.** Each agent keeps private notes in its own file. Notes are saved only
+  when something is worth keeping, duplicates are refused, and outdated notes are marked stale
+  instead of deleted.
+- **Self-updating system prompt.** When a ticket is created, assigned, moved, rejected or
+  approved, the affected agents' prompts are refreshed with their open tickets, matching
+  project knowledge, relevant memories and recent changes.
+- **Lazy loading.** Each MCP server starts the first time something needs it. Code that only
+  moves tickets starts no servers at all.
 
-## 2. What goes where
-
-| File | What it holds | When it is loaded |
-|---|---|---|
-| `agentforge.py` | **Skeleton / core**: teams, TeamLead and Developer nodes, the graph (`move_to`, `branch_to`, `run`), the Kanban board (create, assign, take, move, submit, approve, reject), and `MCPHub` | Always (you import it) |
-| `system_mcp.py` | **System MCP server**: group chat. A `general` channel plus one channel per team | Started the first time an agent calls `say()` or `read_channel()` |
-| `chat_mcp.py` | **Chat MCP server**: personal 1:1 chats and the inbox | Started the first time an agent calls `dm()`, `read_dm()` or `inbox()` |
-| `knowledge_mcp.py` | **Knowledge MCP server**: searches the shared documents in `project_brain/` | Started the first time an agent calls `lookup()` or reads its `system_prompt` |
-| `memory_mcp.py` | **Memory MCP server**: each agent's personal memory, saved in `agent_memory/` | Started the first time an agent calls `remember()`, `recall()` or reads its `system_prompt` |
-| `project_brain/` | **Shared knowledge folder** ("plugin memory"). Holds `AgentForge.pdf`; add any `.pdf`, `.md` or `.txt` | Read by `knowledge_mcp.py` |
-| `agent_memory/` | One JSON file per agent (e.g. `kiran.json`). Created automatically; kept between runs | Read and written by `memory_mcp.py` |
-| `mcp_client.py` | A generic bridge that lets plain synchronous code talk to the async MCP SDK | Imported only when the first server starts |
-| `test_without_ai.py` | 94 tests, no LLM | — |
-| `test_with_ai.py` | End-to-end test with GPT-6 Luna (skipped when there's no `OPENAI_API_KEY`) | — |
-
-The rule for deciding where new code goes:
-- **Core work goes in `agentforge.py`.** That means anything that changes tickets or the graph, including permissions.
-- **Chat goes in an MCP server.** Group features go in `system_mcp.py`; one-to-one features go in `chat_mcp.py`.
-- **Knowledge everyone shares** goes in `project_brain/` as a document.
-- **What one agent learned** goes in that agent's memory, through `memory_mcp.py`.
-
-## 2b. Knowledge, memory and the self-updating system prompt
-
-These three pieces follow section 6 ("Project Brain") of `AgentForge.pdf`.
-
-**Shared knowledge: `project_brain/` + `knowledge_mcp.py`**
-- **What it is.** A folder of reference documents that every agent can search. It's read-only: agents can't change it.
-- **Adding to it.** Drop another `.pdf`, `.md` or `.txt` file into the folder. It's picked up on the next search, with no restart needed.
-- **How search works.** It's keyword search (BM25), following the document's advice to start with exact search before semantic search.
-- **Sources.** Every result says which document and page it came from, so agents can cite it. Headers repeated on every page are stripped out first.
-- **Usage:** `agent.lookup("ticket state machine")` returns `[{"document": "AgentForge.pdf", "page": 8, "text": ..., "score": ...}]`.
-
-**Personal memory: `memory_mcp.py` + `agent_memory/`**
-- **What it is.** Notes one agent decided to keep. They're private to that agent and saved to disk, so they survive into the next run.
-- **Usage:**
-  - `agent.remember(text, kind, source)` saves a note.
-  - `agent.recall(query)` gets matching notes back.
-  - `agent.forget(id, reason)` marks a note as stale.
-- **The "only when needed" rules:**
-  1. Nothing is saved automatically. The node code decides when, or the LLM does. With AI, `ai_reflect` asks GPT-6 Luna after a rejection whether there's a lesson for future tickets.
-  2. Near-duplicates are refused. Remembering the same lesson twice stores it once.
-  3. Old memories are marked stale, never deleted, so the history stays (section 6.4).
-- **Kinds** follow the document's trust policy (section 6.3):
-  - `fact`: verified
-  - `decision`: approved
-  - `hypothesis`: not verified
-  - `observation`: happened once
-
-**Self-updating system prompt: `agent.system_prompt`**
-- **What triggers an update.** Every ticket change (created, assigned, reassigned, moved, rejected, approved) passes through `KanbanBoard._log`. That method tells the ticket's lead and assignee that something changed.
-- **When it rebuilds.** The prompt is marked stale and rebuilt the next time it's read. It's always current, and code that never reads it never starts the knowledge or memory servers.
-- **What it contains:**
-  1. who the agent is and its role's duties
-  2. its open tickets, with any reviewer feedback
-  3. matching passages from `project_brain/`, with their source. These are looked up once per ticket and cached on the ticket. This is the "context packet on a new ticket" from section 6.1.
-  4. the agent's own memories that relate to those tickets
-  5. the last 5 ticket changes that concern it
-- **Version counter.** `agent.prompt_version` goes up each time the text actually changes.
-- **Using it with GPT-6 Luna.** Pass it as the `system` message, as `test_with_ai.py` does.
-
-## 3. What happens when an agent posts a message
+## Project layout
 
 ```
-priya.say("PR is up")                                  agentforge.py  (Agent.say)
-  -> forge.mcp.call("system", "post_message", {...})   agentforge.py  (MCPHub.call)
-       first time? start system_mcp.py, list its tools,
-                   send it every team + agent (register_team / register_agent)
-  -> MCPConnection.call("post_message", {...})         mcp_client.py  (sync -> async bridge)
-  -> JSON-RPC over stdin/stdout
-  -> post_message(sender, channel, text)               system_mcp.py  (checks membership, stores message)
-  <- message dict, or an error "PermissionDenied: ..."
-  <- MCPHub turns the error prefix back into PermissionDenied / NotFound / AgentForgeError
+agentforge_project/
+├── agentforge.py        # core: teams, agents, graph, Kanban board, system prompts
+├── system_mcp.py        # MCP server: group chat channels and group summaries
+├── chat_mcp.py          # MCP server: one-to-one chats, inbox and summaries
+├── knowledge_mcp.py     # MCP server: searches the documents in project_brain/
+├── memory_mcp.py        # MCP server: each agent's personal memory (saved to disk)
+├── mcp_client.py        # bridge that lets synchronous code call the async MCP SDK
+├── project_brain/       # shared knowledge folder (put your .pdf / .md / .txt files here)
+├── agent_memory/        # created automatically; one JSON file per agent
+├── test_without_ai.py   # 94 tests, no LLM needed
+├── test_with_ai.py      # end-to-end test with GPT-6 Luna (skipped without an API key)
+├── requirements.txt
+└── README.md
 ```
 
-Chat data lives **inside the server process**. The forge keeps no copy of it. When you call
-`forge.close()`, the processes stop and the chat history is gone. This is the same as before,
-when everything was in memory.
+Where new code belongs:
+- **Ticket or graph logic** goes in `agentforge.py`.
+- **Group chat** goes in `system_mcp.py`; **one-to-one chat** goes in `chat_mcp.py`.
+- **Knowledge everyone shares** goes in `project_brain/` as a file.
+- **What one agent learned** is saved through `memory_mcp.py`.
 
-`forge.mcp.loaded()` tells you which servers are running at any moment.
-- A run that never chats starts no servers.
-- A run that only posts in group channels starts only `system`.
+## Requirements
 
-## 3b. Chat context: why agents need summaries
+- Python 3.10 or newer (tested on 3.13)
+- The packages in `requirements.txt`: `mcp>=2`, `openai` (only for the AI test) and `pypdf`
+  (for reading PDFs)
 
-The servers keep every message for the life of the forge, so the chat itself never resets.
-The **agent** is what forgets: each LLM call starts with no memory. Unless you put earlier
-messages into the prompt, the agent starts from zero every time. Sending the whole history
-gets long and expensive, so agents ask for a **rolling summary** instead:
+## Installation
+
+Use a virtual environment so the packages stay inside this project folder:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+If `python3 -m venv` fails on Ubuntu with "ensurepip is not available", run
+`sudo apt install python3-venv` and try again.
+
+## Quick start
 
 ```python
-agent.channel_context()          # summary of my team channel  (system_mcp.py)
-agent.channel_context("general") # summary of the general channel
-agent.dm_context("rahul")        # summary of my 1:1 chat with rahul  (chat_mcp.py)
+from agentforge import AgentForge, END
+
+def lead_node(agent, state):
+    # The first time through, create tickets for the goal.
+    if not agent.forge.board.tickets(team=agent.team):
+        agent.create_ticket("Login page", "Email and password form", assignee="priya")
+        agent.say("Created the login ticket for priya.")
+    # Approve anything waiting for review.
+    for ticket in agent.review_queue():
+        agent.approve(ticket.id)
+    return {}
+
+def developer_node(agent, state):
+    # Take the tickets assigned to me, write the code, and submit it.
+    for ticket in agent.available_tickets():
+        agent.take(ticket.id)
+    for ticket in agent.my_tickets(status="IN_PROGRESS"):
+        agent.submit(ticket.id, "def login(): ...")
+    return {}
+
+with AgentForge("demo") as forge:            # stops the MCP servers when the block ends
+    forge.team("frontend")
+    forge.teamlead("rahul", "frontend", fn=lead_node)
+    forge.developer("priya", "frontend", fn=developer_node)
+
+    forge.move_to("priya", "rahul")          # developer hands over to the lead
+    forge.branch_to("rahul", lambda s: END if forge.board.all_done("frontend") else "priya")
+
+    forge.run({}, start="rahul")
+    print(forge.board.render("frontend"))
+    print("servers started:", forge.mcp.loaded())
 ```
 
-How it works:
-1. The agent calls the server's `get_context` tool. The server returns the saved summary and only the messages posted **after** that summary was made.
-2. If there are no new messages, the saved summary is returned straight away and no LLM call is made.
-3. Otherwise the forge's `summarizer(previous_summary, new_messages)` merges the two.
-4. The agent saves the result with `save_summary`. Next time, only newer messages count as new.
+Run `python demo.py` (or paste the code into a file) to see the flow. Nodes are plain
+functions with the signature `fn(agent, state) -> dict`. The dictionary you return is merged
+into the shared `state`.
 
-A few properties follow from this:
-- **One summary per conversation.** There is one summary per channel and one per 1:1 conversation, shared by everyone who is in it. When one member builds it, the others reuse it.
-- **Same privacy rules as messages.** Only members can get a team channel's context, and only the two people in a 1:1 chat can get that chat's context.
-- **Where the summarizer runs.** The servers only *store* summaries. The summarizer runs on the agent side because it needs the LLM.
-  - `AgentForge(summarizer=...)` sets it.
-  - Without AI, the default one simply keeps the latest 20 lines.
-  - `test_with_ai.py` passes `ai_summarizer`, which uses GPT-6 Luna.
-- **How the AI nodes use it.** The lead includes the team channel summary when reviewing. The developer includes the summary of their chat with the lead when fixing a rejected ticket.
-- **Lifetime.** Summaries live in the server processes, like messages, so they are gone after `forge.close()`. To keep context between separate runs, the servers would need to save their data to a file.
+## Ticket rules
 
-## 4. Step by step: using it
+These are enforced by the Kanban board, so they hold no matter which node calls them.
 
-1. **Install** inside a virtual environment: `python3 -m venv .venv`, then `source .venv/bin/activate`, then `pip install -r requirements.txt` (installs `mcp>=2`, `openai`, `pypdf`). The code uses MCP SDK 2.x, where `FastMCP` was renamed `MCPServer`.
-2. **Create teams and agents.**
-   ```python
-   forge = AgentForge("my-run")
-   forge.team("frontend")
-   forge.teamlead("rahul", "frontend")
-   forge.developer("priya", "frontend")
-   ```
-   Adding `rahul` as a developer now raises `RoleConflictError`.
-3. **Wire the graph.** Use `move_to(a, b)` for a fixed next hop, or `branch_to(a, router)`, where `router(state)` returns the next agent's name or `END`.
-4. **Write the node functions.** Each one has the form `fn(agent, state) -> dict`, and you pass it as `fn=` when you create the agent. Inside it, use:
-   - the lead's tools: `create_ticket`, `assign`, `review_queue`, `approve`, `reject`
-   - the developer's tools: `available_tickets`, `take`, `submit`, `my_tickets`
-   - chat (either role): `say`, `read_channel`, `dm`, `read_dm`, `inbox`
-5. **Run:** `forge.run(state, start="rahul")`.
-6. **Close:** call `forge.close()`, or use `with AgentForge() as forge:`. Either way the MCP processes are stopped.
+| Action | Who can do it | Notes |
+|---|---|---|
+| Create a ticket | TeamLead | Optionally assign it to a developer on the same team |
+| Assign or reassign | TeamLead | Only to a developer on the lead's team |
+| Take a ticket (`TODO → IN_PROGRESS`) | Developer | **Only if the lead assigned it to them.** Unassigned tickets are refused |
+| Submit code (`IN_PROGRESS → REVIEW`) | Assigned developer | Attaches the code to the ticket |
+| Pull back own work (`REVIEW → IN_PROGRESS`) | Assigned developer | |
+| Reject with feedback (`REVIEW → IN_PROGRESS`) | TeamLead | Feedback is stored on the ticket |
+| Approve (`REVIEW → DONE`) | TeamLead only | A developer can never mark a ticket DONE |
 
-## 5. The ticket rules (all enforced in `KanbanBoard`)
+Every change is recorded in the ticket's `history`.
 
-- **Creating, assigning and approving.** Only a TeamLead can create, assign, approve (move to DONE) or reject tickets, and only for their own team.
-- **Taking a ticket.** A Developer can take a ticket **only if the lead assigned it to them**.
-  - Taking an unassigned ticket raises `PermissionDenied`.
-  - `available_tickets()` shows only the developer's own assigned TODO tickets.
-- **Allowed moves.**
-  - Developer: TODO → IN_PROGRESS, IN_PROGRESS → REVIEW, and pulling their own work back from REVIEW → IN_PROGRESS.
-  - Lead: REVIEW → DONE, and REVIEW → IN_PROGRESS (reject with feedback).
+## Chat
 
-## 6. Step by step: maintaining it
-
-**Adding a new tool to an existing server** (for example, `delete_message` in `system_mcp.py`):
-1. Write a function decorated with `@server.tool()`. Give it type hints and a docstring. The hints become the input schema and the docstring becomes the tool's description.
-2. For an expected failure, raise `ToolError("PermissionDenied: ...")`. Use one of the prefixes `NotFound`, `PermissionDenied` or `AgentForgeError`.
-3. If agents should have a shortcut for it, add a one-line method on `Agent` that calls `self.forge.mcp.call("system", "delete_message", {...})`.
-4. Add a test in `test_without_ai.py`.
-
-**Adding a whole new MCP server** (for example, `git_mcp.py`):
-1. Copy `chat_mcp.py` as a template, then rename the server and replace its tools.
-2. If the server needs to know who the agents are, give it a `register_agent` tool. If it needs the teams, also give it `register_team`. The hub automatically calls whichever of the two the server has.
-3. Add one line to `MCPHub.REGISTRY` in `agentforge.py`: `"git": os.path.join(_HERE, "git_mcp.py")`.
-4. Call it with `forge.mcp.call("git", "<tool>", {...})`. It starts on first use.
-
-**Trying a server by itself:**
-- `python system_mcp.py` starts the server and waits for MCP messages on stdin.
-- To browse its tools and call them by hand, use any MCP client, such as the MCP Inspector (`npx @modelcontextprotocol/inspector python system_mcp.py`).
-
-## 7. Running the tests
-
+```python
+agent.say("Standup at 10")                  # group channel of my team
+agent.say("Launch freeze", channel="general")
+agent.read_channel()                        # messages in my team channel
+agent.dm("rahul", "Blocked on the API")     # private one-to-one message
+agent.read_dm("rahul")                      # full private conversation
+agent.inbox()                               # unread private messages (marks them read)
 ```
-python test_without_ai.py          # ~60 s: chat, knowledge and memory tests start real server processes
+
+Only team members can read or post in a team channel. Only the two people in a one-to-one
+chat can read it.
+
+### Chat summaries
+
+An LLM agent forgets everything between calls, so it needs a summary of earlier chat:
+
+```python
+agent.channel_context()        # summary of my team channel
+agent.dm_context("rahul")      # summary of my chat with rahul
+```
+
+Only messages newer than the saved summary are summarized, so asking again is cheap. One
+summary per conversation is shared by everyone in it. The summarizer is set when you create the
+forge:
+
+```python
+AgentForge("demo", summarizer=my_summarizer)   # my_summarizer(previous_summary, new_messages) -> str
+```
+
+Without one, a simple default keeps the latest 20 lines.
+
+## Shared knowledge
+
+Put any `.pdf`, `.md` or `.txt` file in `project_brain/`. It is indexed automatically, and
+changes are picked up on the next search without restarting anything.
+
+```python
+hits = agent.lookup("how long do JWT tokens last", top_k=3)
+hits[0]["document"], hits[0]["page"], hits[0]["text"]   # e.g. "api_notes.md", 1, "..."
+```
+
+- Search is keyword ranking (BM25). Lines that repeat on most pages, such as running headers,
+  are removed first.
+- Results always include the document and page, so agents can cite them.
+- Use a different folder by passing `knowledge_dir=` to `AgentForge(...)`.
+
+## Personal memory
+
+Each agent has a private memory, saved to `agent_memory/<name>.json` so it survives between runs.
+
+```python
+agent.remember("Reviewer wants email validation on every form",
+               kind="decision", source="ticket #3")       # {"stored": True, "id": 1}
+agent.remember("reviewer wants email validation on every form!")   # {"stored": False, ...}
+agent.recall("form validation")                           # best matches first
+agent.forget(1, reason="Requirement changed")             # marked stale, kept as history
+agent.memories(include_stale=True)                        # everything, including stale notes
+```
+
+Rules that keep memory small:
+- **Nothing is saved automatically.** Your node code decides when to remember something.
+- **Near-duplicates are refused.**
+- **Stale notes are kept**, not deleted, so the history remains.
+- **Kinds:** `fact` (verified), `decision` (approved), `hypothesis` (unverified), `observation`
+  (happened once).
+
+## The self-updating system prompt
+
+```python
+print(agent.system_prompt)
+```
+
+The prompt contains, in order:
+1. who the agent is and its duties for its role
+2. its open tickets, including any reviewer feedback
+3. matching passages from `project_brain/`, with their source
+4. its own relevant memories
+5. the last five changes to its tickets
+
+It is rebuilt only when something changed, and `agent.prompt_version` goes up each time the
+text really changes. Pass `agent.system_prompt` as the `system` message to an LLM. The AI test
+does this.
+
+## Using an LLM (GPT-6 Luna)
+
+Set your key in the environment, and optionally the model:
+
+```bash
 export OPENAI_API_KEY=sk-...
-python test_with_ai.py             # uses GPT-6 Luna
+export AGENTFORGE_MODEL=gpt-6-luna          # default used by test_with_ai.py
 ```
 
-## 8. A natural next step
+If you use an OpenRouter key instead, also set:
 
-Right now the node code decides when an agent chats. Each server can already describe its
-tools (`forge.mcp.tools("chat")` returns each tool's name, description and `input_schema`). You
-could convert that list into the OpenAI `tools=[...]` format and pass it to GPT-6 Luna. The
-model would then decide for itself when to post or DM, and your loop would run whatever tool
-calls it returns through `forge.mcp.call(...)`. This is where MCP really pays off.
+```bash
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+export AGENTFORGE_MODEL=openai/gpt-6-luna
+```
+
+Never commit your API key. Keep it in environment variables, not in the code.
+
+## Running the tests
+
+```bash
+python -m unittest test_without_ai -v      # 94 tests, about one minute (starts real MCP servers)
+python -m unittest test_with_ai -v         # needs OPENAI_API_KEY; skipped otherwise
+```
+
+The non-AI tests write to temporary folders, so they never touch your real `agent_memory/`.
+
+## Extending the project
+
+**Add a tool to an existing server.** Write a function with `@server.tool()`, give it type hints
+and a docstring (the docstring becomes the tool's description), and raise
+`ToolError("NotFound: ...")` for expected failures. Then add a one-line method on `Agent` that
+calls it through `self.forge.mcp.call(...)`.
+
+**Add a new MCP server.** Copy `chat_mcp.py` as a template, then add one line to
+`AgentForge.MCPHub.REGISTRY`:
+
+```python
+"git": os.path.join(_HERE, "git_mcp.py"),
+```
+
+Call it with `forge.mcp.call("git", "<tool>", {...})`. It starts on first use.
+
+**Try a server by hand.** Run `python system_mcp.py` to start it, or open it with the MCP
+Inspector: `npx @modelcontextprotocol/inspector python system_mcp.py`.
+
+## Design notes
+
+- **Why MCP servers?** Chat, knowledge and memory are tools that can later be used by any MCP
+  client, not only by this framework. Each one is also loaded only when needed.
+- **Why is the core synchronous?** Agents take turns, so plain sequential code is easier to
+  read and test. `mcp_client.py` runs the MCP SDK's async client on a background thread, so the
+  rest of the code can call it like an ordinary function.
+- **Why keyword search?** It needs no extra service and gives exact, citable matches. Meaning-
+  based search can be added later as another server.
+
+## Limitations
+
+- The Kanban board and chat history live in memory. They are lost when the program ends.
+  Personal memory is the only part saved to disk.
+- Knowledge search is keyword-based. A question that uses different words from the document may
+  not find it.
+- The MCP servers run on your machine with no authentication. Use this for local experiments,
+  not as a production service.
+
+## License
+
+Add a license before publishing, for example MIT. Make sure you have the right to publish
+`project_brain/AgentForge.pdf`, or replace it with your own document.
